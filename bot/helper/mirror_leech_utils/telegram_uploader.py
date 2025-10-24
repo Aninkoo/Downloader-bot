@@ -65,175 +65,160 @@ import random
 LOGGER = getLogger(__name__)
 
 class VideoProcessor:
-    def __init__(self, config_path: str = None):
-        # Load optional config
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, 'r') as f:
-                    self.config = json.load(f)
-            except Exception:
-                self.config = {}
-        else:
-            self.config = {}
-
-        # ✅ Reliable cover.png detection
-        module_cover = os.path.join(os.path.dirname(__file__), "cover.png")
+    def __init__(self):
+        # Set cover image path
+        default_cover = os.path.join(os.path.dirname(__file__), "cover.png")
         alt_cover = "/usr/src/app/bot/helper/mirror_leech_utils/cover.png"
-        alt_cover_2 = "/usr/src/app/bot/helper/cover.png"
+        self.cover_path = alt_cover if os.path.exists(alt_cover) else default_cover
 
-        if os.path.exists(alt_cover):
-            self.cover_path = alt_cover
-        elif os.path.exists(alt_cover_2):
-            self.cover_path = alt_cover_2
-        elif os.path.exists(module_cover):
-            self.cover_path = module_cover
-        else:
-            LOGGER.warning("⚠️ cover.png not found — skipping attach.")
+        if not os.path.exists(self.cover_path):
+            LOGGER.warning(f"⚠️ cover.png not found at {self.cover_path}")
             self.cover_path = None
 
-        # Language mapping
-        self.language_map = {
-            'eng': 'English', 'en': 'English', 'english': 'English',
-            'hin': 'Hindi', 'hi': 'Hindi', 'hindi': 'Hindi',
-            'spa': 'Spanish', 'es': 'Spanish', 'spanish': 'Spanish',
-            'fre': 'French', 'fr': 'French', 'french': 'French',
-            'deu': 'German', 'de': 'German', 'german': 'German',
-            'ita': 'Italian', 'it': 'Italian', 'italian': 'Italian',
-            'por': 'Portuguese', 'pt': 'Portuguese', 'portuguese': 'Portuguese',
-            'rus': 'Russian', 'ru': 'Russian', 'russian': 'Russian',
-            'jpn': 'Japanese', 'ja': 'Japanese', 'japanese': 'Japanese',
-            'kor': 'Korean', 'ko': 'Korean', 'korean': 'Korean',
-            'chi': 'Chinese', 'zh': 'Chinese', 'chinese': 'Chinese',
-            'ara': 'Arabic', 'ar': 'Arabic', 'arabic': 'Arabic',
-            'tur': 'Turkish', 'tr': 'Turkish', 'turkish': 'Turkish',
-            'urd': 'Urdu', 'ur': 'Urdu', 'urdu': 'Urdu',
-            'ben': 'Bengali', 'bn': 'Bengali', 'bengali': 'Bengali',
-            'tam': 'Tamil', 'ta': 'Tamil', 'tamil': 'Tamil',
-            'tel': 'Telugu', 'te': 'Telugu', 'telugu': 'Telugu',
-            'mal': 'Malayalam', 'ml': 'Malayalam', 'malayalam': 'Malayalam',
-            'kan': 'Kannada', 'kn': 'Kannada', 'kannada': 'Kannada',
-        }
-
     # ──────────────────────────────────────────────
-    def _map_language_code(self, code: str) -> str:
-        code_lower = (code or "").lower().strip()
-        return self.language_map.get(code_lower, code or "")
-
-    # ──────────────────────────────────────────────
-    async def _build_stream_metadata_args(self, input_path: str) -> list:
-        args = []
+    async def run_ffmpeg(self, cmd):
+        """Run FFmpeg asynchronously"""
         try:
-            probe = await asyncio.to_thread(ffmpeg.probe, input_path)
-            streams = probe.get('streams', [])
-            audio_idx = sub_idx = 0
-            eng_audio = eng_sub = None
-
-            for s in streams:
-                if s.get('codec_type') == 'audio':
-                    lang = s.get('tags', {}).get('language', '').lower()
-                    if lang in ('en', 'eng', 'english'):
-                        eng_audio = audio_idx
-                    audio_idx += 1
-                elif s.get('codec_type') == 'subtitle':
-                    lang = s.get('tags', {}).get('language', '').lower()
-                    if lang in ('en', 'eng', 'english'):
-                        eng_sub = sub_idx
-                    sub_idx += 1
-
-            audio_idx = sub_idx = 0
-            for s in streams:
-                if s.get('codec_type') == 'audio':
-                    lang = s.get('tags', {}).get('language', '')
-                    lang_name = self._map_language_code(lang)
-                    title = f"{lang_name} @paxtv" if lang_name else "@paxtv"
-                    args += [f"-metadata:s:a:{audio_idx}", f"title={title}"]
-                    if eng_audio is not None:
-                        disp = "default" if audio_idx == eng_audio else "0"
-                        args += [f"-disposition:a:{audio_idx}", disp]
-                    audio_idx += 1
-
-                elif s.get('codec_type') == 'subtitle':
-                    lang = s.get('tags', {}).get('language', '')
-                    lang_name = self._map_language_code(lang)
-                    title = f"{lang_name} @paxtv" if lang_name else "@paxtv"
-                    args += [f"-metadata:s:s:{sub_idx}", f"title={title}"]
-                    if eng_sub is not None:
-                        disp = "default" if sub_idx == eng_sub else "0"
-                        args += [f"-disposition:s:{sub_idx}", disp]
-                    sub_idx += 1
-
-        except Exception as e:
-            LOGGER.warning(f"Failed to probe {input_path}: {e}")
-        return args
-
-    # ──────────────────────────────────────────────
-    async def _finalize_process(self, process):
-        try:
-            if not process:
-                return
-            if getattr(process, "returncode", None) is None:
-                process.kill()
-                await process.wait()
-            if getattr(process, "stdout", None):
-                process.stdout.close()
-            if getattr(process, "stderr", None):
-                process.stderr.close()
-        finally:
-            gc.collect()
-
-    # ──────────────────────────────────────────────
-    async def copy_file_with_thumbnail(self, input_path: str, output_path: str, progress_callback=None) -> bool:
-        process = None
-        try:
-            if not os.path.exists(input_path):
-                LOGGER.error(f"Input file missing: {input_path}")
-                return False
-
-            if not output_path.endswith(".mkv"):
-                output_path = os.path.splitext(output_path)[0] + ".mkv"
-
-            metadata_args = await self._build_stream_metadata_args(input_path)
-
-            cmd = ["ffmpeg", "-i", input_path, "-map", "0", "-c", "copy"]
-            if self.cover_path and os.path.exists(self.cover_path):
-                cmd += ["-attach", self.cover_path, "-metadata:s:t:0", "mimetype=image/png"]
-
-            cmd += metadata_args + ["-f", "matroska", "-y", output_path]
-
             LOGGER.info(f"▶️ FFmpeg command: {' '.join(cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            _, stderr = await process.communicate()
-            stderr_text = stderr.decode(errors="ignore")
-
-            # ✅ Fixed success logic
+            stdout, stderr = await process.communicate()
             if process.returncode != 0:
-                # FFmpeg sometimes warns with nonzero but writes valid output
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                    LOGGER.warning(
-                        f"⚠️ FFmpeg returned {process.returncode} but output file exists — treating as success."
-                    )
-                else:
-                    LOGGER.error(f"❌ FFmpeg failed: {stderr_text}")
-                    return False
-
-            # Double check file actually created
-            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                LOGGER.error("❌ No output file generated.")
+                LOGGER.error(stderr.decode(errors="ignore"))
                 return False
-
-            LOGGER.info(f"✅ Successfully processed: {output_path}")
-            if progress_callback:
-                await progress_callback("✅ File processed successfully")
             return True
-
         except Exception as e:
-            LOGGER.error(f"Error processing {input_path}: {e}")
+            LOGGER.error(f"FFmpeg exec error: {e}")
             return False
 
-        finally:
-            await self._finalize_process(process)       
+    # ──────────────────────────────────────────────
+    async def extract_audio_track_info(self, file_path):
+        """Extract audio stream information from file"""
+        try:
+            probe = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error', '-select_streams', 'a',
+                '-show_entries', 'stream=index:stream_tags=title,language',
+                '-of', 'json', file_path,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = await probe.communicate()
+            info = json.loads(stdout.decode())
+            return info.get("streams", [])
+        except Exception as e:
+            LOGGER.error(f"Error extracting audio info: {e}")
+            return []
+
+    # ──────────────────────────────────────────────
+    async def extract_subtitle_info(self, file_path):
+        """Extract subtitle stream information"""
+        try:
+            probe = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error', '-select_streams', 's',
+                '-show_entries', 'stream=index:stream_tags=title,language',
+                '-of', 'json', file_path,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = await probe.communicate()
+            info = json.loads(stdout.decode())
+            return info.get("streams", [])
+        except Exception as e:
+            LOGGER.error(f"Error extracting subtitle info: {e}")
+            return []
+
+    # ──────────────────────────────────────────────
+    async def copy_file_with_thumbnail(self, input_path, output_path, metadata_args):
+        """Copy MKV while embedding cover and metadata"""
+        if not os.path.exists(input_path):
+            LOGGER.error(f"Input missing before FFmpeg: {input_path}")
+            return False
+
+        cmd = ["ffmpeg", "-i", input_path, "-map", "0", "-c", "copy"]
+
+        if self.cover_path:
+            cmd += [
+                "-attach", self.cover_path,
+                "-metadata:s:t:0", "mimetype=image/png",
+            ]
+
+        cmd += metadata_args + ["-f", "matroska", "-y", output_path]
+        success = await self.run_ffmpeg(cmd)
+
+        if success and os.path.exists(output_path):
+            LOGGER.info(f"✅ FFmpeg success → {output_path}")
+            return True
+        else:
+            LOGGER.error(f"❌ FFmpeg did not produce {output_path}")
+            return False
+
+    # ──────────────────────────────────────────────
+    async def process_video(self, file_path, metadata):
+        """
+        Process a video file by embedding metadata and optional cover image.
+        Output will be saved in the same directory as the input.
+        """
+        try:
+            input_dir = os.path.dirname(file_path)
+            base_name = os.path.basename(file_path)
+            processed_path = os.path.join(input_dir, f"processed_{base_name}")
+
+            # Prepare metadata
+            metadata_args = []
+            for key, value in metadata.items():
+                if isinstance(value, (str, int, float)) and value:
+                    safe_value = str(value).replace('"', "'")
+                    metadata_args += ["-metadata", f"{key}={safe_value}"]
+
+            LOGGER.info(f"Starting video processing: {file_path} -> {processed_path}")
+            success = await self.copy_file_with_thumbnail(file_path, processed_path, metadata_args)
+
+            if success and os.path.exists(processed_path):
+                # Replace original file with processed version
+                os.replace(processed_path, file_path)
+                LOGGER.info(f"✅ Processing complete: {file_path}")
+                return file_path
+            else:
+                LOGGER.warning(f"⚠️ Video processing failed, keeping original: {file_path}")
+                return file_path
+
+        except Exception as e:
+            LOGGER.error(f"Error processing {file_path}: {e}")
+            return file_path
+
+    # ──────────────────────────────────────────────
+    def create_cover_image(self, text, output_path):
+        """Generate a fallback cover image with text"""
+        try:
+            img = Image.new("RGB", (600, 900), (30, 30, 30))
+            draw = ImageDraw.Draw(img)
+            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            font = ImageFont.truetype(font_path, 40)
+            w, h = draw.textsize(text, font=font)
+            draw.text(((600 - w) / 2, (900 - h) / 2), text, font=font, fill=(255, 255, 255))
+            img.save(output_path)
+            LOGGER.info(f"🖼️ Generated new cover image: {output_path}")
+            return output_path
+        except Exception as e:
+            LOGGER.error(f"Error creating cover image: {e}")
+            return None
+
+    # ──────────────────────────────────────────────
+    def sanitize_string(self, text):
+        """Remove unsafe filename characters"""
+        return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', text).strip()
+
+    # ──────────────────────────────────────────────
+    def cleanup_temp_dir(self, temp_dir):
+        """Safely delete temporary files"""
+        try:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                LOGGER.debug(f"🧹 Cleaned up temp dir: {temp_dir}")
+            gc.collect()
+        except Exception as e:
+            LOGGER.warning(f"Cleanup failed for {temp_dir}: {e}")
+    
+            
                              
 class TelegramUploader:
     def __init__(self, listener, path):
