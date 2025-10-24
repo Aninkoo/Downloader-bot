@@ -48,7 +48,192 @@ from bot.helper.ext_utils.media_utils import (
 )
 from bot.helper.telegram_helper.message_utils import delete_message
 
+# Import VideoProcessor components
+import os
+import json
+import asyncio
+import ffmpeg
+import logging
+import subprocess
+import tempfile
+import shutil
+import re
+import gc
+
 LOGGER = getLogger(__name__)
+
+class VideoProcessor:
+    def __init__(self, config_path: str = None):
+        # If no config path provided, create a minimal default config
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+        else:
+            self.config = {}
+        
+        self.watermark_path = ospath.join(ospath.dirname(__file__), "watermark.png")
+        self.cover_path = ospath.join(ospath.dirname(__file__), "cover.png")
+
+        self.language_map = {
+            'eng': 'English', 'en': 'English', 'english': 'English',
+            'hin': 'Hindi', 'hi': 'Hindi', 'hindi': 'Hindi',
+            'spa': 'Spanish', 'es': 'Spanish', 'spanish': 'Spanish',
+            'fre': 'French', 'fr': 'French', 'french': 'French',
+            'deu': 'German', 'de': 'German', 'german': 'German',
+            'ita': 'Italian', 'it': 'Italian', 'italian': 'Italian',
+            'por': 'Portuguese', 'pt': 'Portuguese', 'portuguese': 'Portuguese',
+            'rus': 'Russian', 'ru': 'Russian', 'russian': 'Russian',
+            'jpn': 'Japanese', 'ja': 'Japanese', 'japanese': 'Japanese',
+            'kor': 'Korean', 'ko': 'Korean', 'korean': 'Korean',
+            'chi': 'Chinese', 'zh': 'Chinese', 'chinese': 'Chinese',
+            'ara': 'Arabic', 'ar': 'Arabic', 'arabic': 'Arabic',
+            'tur': 'Turkish', 'tr': 'Turkish', 'turkish': 'Turkish',
+            'urd': 'Urdu', 'ur': 'Urdu', 'urdu': 'Urdu',
+            'ben': 'Bengali', 'bn': 'Bengali', 'bengali': 'Bengali',
+            'tam': 'Tamil', 'ta': 'Tamil', 'tamil': 'Tamil',
+            'tel': 'Telugu', 'te': 'Telugu', 'telugu': 'Telugu',
+            'mar': 'Marathi', 'mr': 'Marathi', 'marathi': 'Marathi',
+            'guj': 'Gujarati', 'gu': 'Gujarati', 'gujarati': 'Gujarati',
+            'kan': 'Kannada', 'kn': 'Kannada', 'kannada': 'Kannada',
+            'mal': 'Malayalam', 'ml': 'Malayalam', 'malayalam': 'Malayalam',
+            'pan': 'Punjabi', 'pa': 'Punjabi', 'punjabi': 'Punjabi',
+        }
+
+    def _map_language_code(self, code: str) -> str:
+        code_lower = code.lower().strip()
+        return self.language_map.get(code_lower, code)
+
+    async def _build_stream_metadata_args(self, input_path: str) -> list:
+        """Build ffmpeg -metadata arguments for audio/subtitle stream renaming and set English defaults."""
+        args = []
+        try:
+            probe = await asyncio.to_thread(ffmpeg.probe, input_path)
+            streams = probe.get('streams', [])
+
+            audio_idx = 0
+            subtitle_idx = 0
+            eng_audio_index = None
+            eng_sub_index = None
+
+            # Identify English audio/subtitle streams
+            for stream in streams:
+                if stream['codec_type'] == 'audio':
+                    lang = stream.get('tags', {}).get('language', '').lower()
+                    if lang in ('en', 'eng', 'english'):
+                        eng_audio_index = audio_idx
+                    audio_idx += 1
+                elif stream['codec_type'] == 'subtitle':
+                    lang = stream.get('tags', {}).get('language', '').lower()
+                    if lang in ('en', 'eng', 'english'):
+                        eng_sub_index = subtitle_idx
+                    subtitle_idx += 1
+
+            # Reset counters for metadata tagging
+            audio_idx = 0
+            subtitle_idx = 0
+
+            # Build metadata and disposition args
+            for stream in streams:
+                if stream['codec_type'] == 'audio':
+                    lang = stream.get('tags', {}).get('language', '').strip()
+                    lang_name = self._map_language_code(lang) if lang else ""
+                    title = f"{lang_name} @paxtv on Telegram" if lang_name else "@paxtv on Telegram"
+                    args += [f"-metadata:s:a:{audio_idx}", f"title={title}"]
+                    if eng_audio_index is not None:
+                        if audio_idx == eng_audio_index:
+                            args += [f"-disposition:a:{audio_idx}", "default"]
+                        else:
+                            args += [f"-disposition:a:{audio_idx}", "0"]
+                    audio_idx += 1
+
+                elif stream['codec_type'] == 'subtitle':
+                    lang = stream.get('tags', {}).get('language', '').strip()
+                    lang_name = self._map_language_code(lang) if lang else ""
+                    title = f"{lang_name} @paxtv on Telegram" if lang_name else "@paxtv on Telegram"
+                    args += [f"-metadata:s:s:{subtitle_idx}", f"title={title}"]
+                    if eng_sub_index is not None:
+                        if subtitle_idx == eng_sub_index:
+                            args += [f"-disposition:s:{subtitle_idx}", "default"]
+                        else:
+                            args += [f"-disposition:s:{subtitle_idx}", "0"]
+                    subtitle_idx += 1
+
+        except Exception as e:
+            LOGGER.warning(f"Failed to build stream metadata args: {e}")
+        return args
+
+    async def _finalize_process(self, process: asyncio.subprocess.Process | None):
+        try:
+            if not process:
+                return
+            if getattr(process, 'returncode', None) is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+            if getattr(process, 'stdout', None):
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+            if getattr(process, 'stderr', None):
+                try:
+                    process.stderr.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+    async def copy_file_with_thumbnail(self, input_path: str, output_path: str, progress_callback=None) -> bool:
+        process = None
+        try:
+            if progress_callback:
+                await progress_callback("📋 Processing video file with thumbnail...")
+
+            if not output_path.endswith('.mkv'):
+                output_path = ospath.splitext(output_path)[0] + '.mkv'
+
+            metadata_args = await self._build_stream_metadata_args(input_path)
+
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-map', '0',
+                '-c', 'copy',
+                '-attach', self.cover_path,
+                '-metadata:s:t:0', 'mimetype=image/png',
+                *metadata_args,
+                '-f', 'matroska', '-y', output_path
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
+            )
+
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                LOGGER.error(f"FFmpeg copy failed: {stderr.decode()}")
+                if progress_callback:
+                    await progress_callback("❌ File processing failed")
+                return False
+
+            if progress_callback:
+                await progress_callback("✅ File processed with thumbnail!")
+            return True
+        except Exception as e:
+            LOGGER.error(f"Error processing file: {e}")
+            if progress_callback:
+                await progress_callback(f"❌ Processing error: {str(e)}")
+            return False
+        finally:
+            await self._finalize_process(process)
 
 
 class TelegramUploader:
@@ -76,6 +261,9 @@ class TelegramUploader:
         self.log_msg = None
         self._user_session = self._listener.user_transmission
         self._error = ""
+        
+        # Initialize VideoProcessor
+        self.video_processor = VideoProcessor()
 
     async def _upload_progress(self, current, _):
         if self._listener.is_cancelled:
@@ -186,6 +374,45 @@ class TelegramUploader:
             self._up_path = new_path
         return cap_mono
 
+    async def _process_video_file(self, file_path: str) -> str:
+        """Process MKV/MP4 files with VideoProcessor and return the processed file path."""
+        try:
+            if not file_path.lower().endswith(('.mkv', '.mp4')):
+                return file_path
+
+            LOGGER.info(f"Processing video file: {file_path}")
+            
+            # Create a temporary output path
+            base_name = ospath.splitext(file_path)[0]
+            processed_path = f"{base_name}_processed.mkv"
+            
+            # Define progress callback for video processing
+            async def progress_callback(message):
+                LOGGER.info(f"Video Processing: {message}")
+                # You can also send progress updates to the user if needed
+                # await self._listener.onUploadProgress(message)
+            
+            # Process the video file
+            success = await self.video_processor.copy_file_with_thumbnail(
+                file_path, processed_path, progress_callback
+            )
+            
+            if success and await aiopath.exists(processed_path):
+                # Remove original file and rename processed file
+                await remove(file_path)
+                await rename(processed_path, file_path)
+                LOGGER.info(f"Successfully processed video file: {file_path}")
+                return file_path
+            else:
+                LOGGER.warning(f"Video processing failed, using original file: {file_path}")
+                if await aiopath.exists(processed_path):
+                    await remove(processed_path)
+                return file_path
+                
+        except Exception as e:
+            LOGGER.error(f"Error processing video file {file_path}: {e}")
+            return file_path
+
     def _get_input_media(self, subkey, key):
         rlist = []
         for msg in self._media_dict[key][subkey]:
@@ -274,6 +501,13 @@ class TelegramUploader:
                     if self._listener.is_cancelled:
                         return
                     cap_mono = await self._prepare_file(file_, dirpath)
+                    
+                    # Intercept and process MKV/MP4 files before upload
+                    if self._up_path.lower().endswith(('.mkv', '.mp4')):
+                        LOGGER.info(f"Intercepting video file for processing: {self._up_path}")
+                        await self._listener.onUploadStart()  # Notify processing start
+                        self._up_path = await self._process_video_file(self._up_path)
+                    
                     if self._last_msg_in_group:
                         group_lists = [
                             x for v in self._media_dict.values() for x in v
