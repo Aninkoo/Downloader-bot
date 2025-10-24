@@ -400,7 +400,7 @@ class TelegramUploader:
         return cap_mono
 
     async def _process_video_file(self, file_path: str) -> str:
-        """Process MKV/MP4 files with VideoProcessor and return the processed file path."""
+        """Process MKV/MP4 files with VideoProcessor using the original file directly."""
         try:
             if not file_path.lower().endswith(('.mkv', '.mp4')):
                 LOGGER.info(f"Skipping non-video file: {file_path}")
@@ -413,39 +413,19 @@ class TelegramUploader:
                 LOGGER.error(f"Original file does not exist: {file_path}")
                 return file_path
 
-            # Generate a sanitized filename with random numbers in /usr/src/app/downloads
-            downloads_dir = "/usr/src/app/downloads"
+            # Create output filename in the same directory
+            dir_path = ospath.dirname(file_path)
             base_name = ospath.splitext(ospath.basename(file_path))[0]
-            random_suffix = ''.join(random.choices('0123456789', k=8))
-            
-            # Create sanitized input filename in downloads directory
-            sanitized_input_name = f"temp_input_{random_suffix}.mkv"
-            temp_input_path = ospath.join(downloads_dir, sanitized_input_name)
-            
-            # Create output filename in downloads directory
-            processed_output_name = f"temp_processed_{random_suffix}.mkv"
-            processed_output_path = ospath.join(downloads_dir, processed_output_name)
-            
-            LOGGER.info(f"Copying original file to sanitized name: {file_path} -> {temp_input_path}")
-            
-            # Copy the file using shutil in a thread
-            await asyncio.to_thread(shutil.copy2, file_path, temp_input_path)
-            
-            # Verify the copy was successful
-            if not await aiopath.exists(temp_input_path):
-                raise Exception("Failed to copy file to temporary location")
-                
-            file_size = await aiopath.getsize(temp_input_path)
-            LOGGER.info(f"Successfully copied file. Size: {file_size} bytes")
+            processed_output_path = ospath.join(dir_path, f"{base_name}_processed.mkv")
             
             # Define progress callback for video processing
             async def progress_callback(message):
                 LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
             
-            # Process the video file using the sanitized temp file
-            LOGGER.info(f"Starting video processing with sanitized filename: {temp_input_path} -> {processed_output_path}")
+            # Process the video file using the ORIGINAL file directly
+            LOGGER.info(f"Starting video processing with original file: {file_path} -> {processed_output_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
-                temp_input_path, processed_output_path, progress_callback
+                file_path, processed_output_path, progress_callback
             )
             
             if success:
@@ -460,38 +440,24 @@ class TelegramUploader:
                     await remove(file_path)
                     await rename(processed_output_path, file_path)
                     LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
-                    
-                    # Clean up temporary input file
-                    if await aiopath.exists(temp_input_path):
-                        await remove(temp_input_path)
-                        LOGGER.info(f"Cleaned up temporary input file: {temp_input_path}")
-                    
                     return file_path
                 else:
                     LOGGER.error(f"Processed file not found: {processed_output_path}")
-                    # Clean up temporary input file
-                    if await aiopath.exists(temp_input_path):
-                        await remove(temp_input_path)
                     return file_path
             else:
                 LOGGER.warning(f"Video processing failed, using original file: {file_path}")
-                # Clean up temporary input file
-                if await aiopath.exists(temp_input_path):
-                    await remove(temp_input_path)
                 return file_path
                 
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {str(e)}")
-            # Clean up any temporary files that might have been created in downloads directory
+            # Clean up any temporary processed file that might have been created
             try:
-                downloads_dir = "/usr/src/app/downloads"
-                temp_files = [f for f in await asyncio.to_thread(os.listdir, downloads_dir) 
-                             if f.startswith('temp_') and f.endswith('.mkv')]
-                for temp_file in temp_files:
-                    temp_path = ospath.join(downloads_dir, temp_file)
-                    if await aiopath.exists(temp_path):
-                        await remove(temp_path)
-                        LOGGER.info(f"Cleaned up temporary file: {temp_path}")
+                dir_path = ospath.dirname(file_path)
+                base_name = ospath.splitext(ospath.basename(file_path))[0]
+                processed_file = ospath.join(dir_path, f"{base_name}_processed.mkv")
+                if await aiopath.exists(processed_file):
+                    await remove(processed_file)
+                    LOGGER.info(f"Cleaned up temporary processed file: {processed_file}")
             except Exception as cleanup_error:
                 LOGGER.warning(f"Error during cleanup: {cleanup_error}")
             
