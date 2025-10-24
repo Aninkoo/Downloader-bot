@@ -1,7 +1,6 @@
 import contextlib
 from asyncio import sleep
 from logging import getLogger
-import os
 from os import path as ospath
 from os import walk
 from re import match as re_match
@@ -65,172 +64,202 @@ import random
 LOGGER = getLogger(__name__)
 
 class VideoProcessor:
-    def __init__(self):
-        # Cover image path handling
-        default_cover = os.path.join(os.path.dirname(__file__), "cover.png")
-        alt_cover = "/usr/src/app/bot/helper/mirror_leech_utils/cover.png"
-        self.cover_path = alt_cover if os.path.exists(alt_cover) else default_cover
+    def __init__(self, config_path: str = None):
+        # If no config path provided, create a minimal default config
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                self.config = json.load(f)
+        else:
+            self.config = {}
+        
+        self.watermark_path = ospath.join(ospath.dirname(__file__), "watermark.png")
+        self.cover_path = ospath.join(ospath.dirname(__file__), "cover.png")
 
-        if not os.path.exists(self.cover_path):
-            LOGGER.warning(f"⚠️ cover.png not found at {self.cover_path}")
-            self.cover_path = None
+        self.language_map = {
+            'eng': 'English', 'en': 'English', 'english': 'English',
+            'hin': 'Hindi', 'hi': 'Hindi', 'hindi': 'Hindi',
+            'spa': 'Spanish', 'es': 'Spanish', 'spanish': 'Spanish',
+            'fre': 'French', 'fr': 'French', 'french': 'French',
+            'deu': 'German', 'de': 'German', 'german': 'German',
+            'ita': 'Italian', 'it': 'Italian', 'italian': 'Italian',
+            'por': 'Portuguese', 'pt': 'Portuguese', 'portuguese': 'Portuguese',
+            'rus': 'Russian', 'ru': 'Russian', 'russian': 'Russian',
+            'jpn': 'Japanese', 'ja': 'Japanese', 'japanese': 'Japanese',
+            'kor': 'Korean', 'ko': 'Korean', 'korean': 'Korean',
+            'chi': 'Chinese', 'zh': 'Chinese', 'chinese': 'Chinese',
+            'ara': 'Arabic', 'ar': 'Arabic', 'arabic': 'Arabic',
+            'tur': 'Turkish', 'tr': 'Turkish', 'turkish': 'Turkish',
+            'urd': 'Urdu', 'ur': 'Urdu', 'urdu': 'Urdu',
+            'ben': 'Bengali', 'bn': 'Bengali', 'bengali': 'Bengali',
+            'tam': 'Tamil', 'ta': 'Tamil', 'tamil': 'Tamil',
+            'tel': 'Telugu', 'te': 'Telugu', 'telugu': 'Telugu',
+            'mar': 'Marathi', 'mr': 'Marathi', 'marathi': 'Marathi',
+            'guj': 'Gujarati', 'gu': 'Gujarati', 'gujarati': 'Gujarati',
+            'kan': 'Kannada', 'kn': 'Kannada', 'kannada': 'Kannada',
+            'mal': 'Malayalam', 'ml': 'Malayalam', 'malayalam': 'Malayalam',
+            'pan': 'Punjabi', 'pa': 'Punjabi', 'punjabi': 'Punjabi',
+        }
 
-    # ──────────────────────────────────────────────
-    async def run_ffmpeg(self, cmd):
-        """Run FFmpeg asynchronously and return success/failure."""
+    def _map_language_code(self, code: str) -> str:
+        code_lower = code.lower().strip()
+        return self.language_map.get(code_lower, code)
+
+    async def _build_stream_metadata_args(self, input_path: str) -> list:
+        """Build ffmpeg -metadata arguments for audio/subtitle stream renaming and set English defaults."""
+        args = []
         try:
-            LOGGER.info(f"▶️ FFmpeg command: {' '.join(cmd)}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode != 0:
-                LOGGER.error(f"❌ FFmpeg failed: {stderr.decode(errors='ignore')}")
+            probe = await asyncio.to_thread(ffmpeg.probe, input_path)
+            streams = probe.get('streams', [])
+
+            audio_idx = 0
+            subtitle_idx = 0
+            eng_audio_index = None
+            eng_sub_index = None
+
+            # Identify English audio/subtitle streams
+            for stream in streams:
+                if stream['codec_type'] == 'audio':
+                    lang = stream.get('tags', {}).get('language', '').lower()
+                    if lang in ('en', 'eng', 'english'):
+                        eng_audio_index = audio_idx
+                    audio_idx += 1
+                elif stream['codec_type'] == 'subtitle':
+                    lang = stream.get('tags', {}).get('language', '').lower()
+                    if lang in ('en', 'eng', 'english'):
+                        eng_sub_index = subtitle_idx
+                    subtitle_idx += 1
+
+            # Reset counters for metadata tagging
+            audio_idx = 0
+            subtitle_idx = 0
+
+            # Build metadata and disposition args
+            for stream in streams:
+                if stream['codec_type'] == 'audio':
+                    lang = stream.get('tags', {}).get('language', '').strip()
+                    lang_name = self._map_language_code(lang) if lang else ""
+                    title = f"{lang_name} @paxtv on Telegram" if lang_name else "@paxtv on Telegram"
+                    args += [f"-metadata:s:a:{audio_idx}", f"title={title}"]
+                    if eng_audio_index is not None:
+                        if audio_idx == eng_audio_index:
+                            args += [f"-disposition:a:{audio_idx}", "default"]
+                        else:
+                            args += [f"-disposition:a:{audio_idx}", "0"]
+                    audio_idx += 1
+
+                elif stream['codec_type'] == 'subtitle':
+                    lang = stream.get('tags', {}).get('language', '').strip()
+                    lang_name = self._map_language_code(lang) if lang else ""
+                    title = f"{lang_name} @paxtv on Telegram" if lang_name else "@paxtv on Telegram"
+                    args += [f"-metadata:s:s:{subtitle_idx}", f"title={title}"]
+                    if eng_sub_index is not None:
+                        if subtitle_idx == eng_sub_index:
+                            args += [f"-disposition:s:{subtitle_idx}", "default"]
+                        else:
+                            args += [f"-disposition:s:{subtitle_idx}", "0"]
+                    subtitle_idx += 1
+
+        except Exception as e:
+            LOGGER.warning(f"Failed to build stream metadata args: {e}")
+        return args
+
+    async def _finalize_process(self, process: asyncio.subprocess.Process | None):
+        try:
+            if not process:
+                return
+            if getattr(process, 'returncode', None) is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+            if getattr(process, 'stdout', None):
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+            if getattr(process, 'stderr', None):
+                try:
+                    process.stderr.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+    async def copy_file_with_thumbnail(self, input_path: str, output_path: str, progress_callback=None) -> bool:
+        process = None
+        try:
+            if progress_callback:
+                await progress_callback("📋 Processing video file with thumbnail...")
+
+            if not output_path.endswith('.mkv'):
+                output_path = ospath.splitext(output_path)[0] + '.mkv'
+
+            # Verify input file exists and is accessible
+            if not await aiopath.exists(input_path):
+                LOGGER.error(f"Input file does not exist: {input_path}")
+                if progress_callback:
+                    await progress_callback("❌ Input file not found")
                 return False
+
+            input_size = await aiopath.getsize(input_path)
+            LOGGER.info(f"Input file size: {input_size} bytes")
+
+            metadata_args = await self._build_stream_metadata_args(input_path)
+
+            cmd = [
+                'ffmpeg', '-i', input_path,
+                '-map', '0',
+                '-c', 'copy',
+                '-attach', self.cover_path,
+                '-metadata:s:t:0', 'mimetype=image/png',
+                *metadata_args,
+                '-f', 'matroska', '-y', output_path
+            ]
+
+            LOGGER.info(f"Executing FFmpeg command for video processing: {' '.join(cmd)}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
+            )
+
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
+                LOGGER.error(f"FFmpeg copy failed with return code {process.returncode}: {error_msg}")
+                if progress_callback:
+                    await progress_callback("❌ File processing failed")
+                return False
+
+            # Verify output file was created
+            if not await aiopath.exists(output_path):
+                LOGGER.error(f"Output file was not created: {output_path}")
+                if progress_callback:
+                    await progress_callback("❌ Output file not created")
+                return False
+
+            output_size = await aiopath.getsize(output_path)
+            LOGGER.info(f"Output file size: {output_size} bytes")
+
+            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path}")
+            if progress_callback:
+                await progress_callback("✅ File processed with thumbnail!")
             return True
         except Exception as e:
-            LOGGER.error(f"FFmpeg exec error: {e}")
+            LOGGER.error(f"Error processing file {input_path}: {e}")
+            if progress_callback:
+                await progress_callback(f"❌ Processing error: {str(e)}")
             return False
+        finally:
+            await self._finalize_process(process)
 
-    # ──────────────────────────────────────────────
-    async def extract_audio_track_info(self, file_path):
-        """Extract audio stream information."""
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "error", "-select_streams", "a",
-                "-show_entries", "stream=index:stream_tags=title,language",
-                "-of", "json", file_path,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, _ = await probe.communicate()
-            info = json.loads(stdout.decode())
-            return info.get("streams", [])
-        except Exception as e:
-            LOGGER.error(f"Error extracting audio info: {e}")
-            return []
 
-    # ──────────────────────────────────────────────
-    async def extract_subtitle_info(self, file_path):
-        """Extract subtitle stream information."""
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "error", "-select_streams", "s",
-                "-show_entries", "stream=index:stream_tags=title,language",
-                "-of", "json", file_path,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, _ = await probe.communicate()
-            info = json.loads(stdout.decode())
-            return info.get("streams", [])
-        except Exception as e:
-            LOGGER.error(f"Error extracting subtitle info: {e}")
-            return []
-
-    # ──────────────────────────────────────────────
-    async def copy_file_with_thumbnail(self, input_path, output_path, metadata_args):
-        """
-        Copy the video with metadata and optional cover image.
-        """
-        try:
-            if not os.path.exists(input_path):
-                LOGGER.error(f"Input file missing before FFmpeg: {input_path}")
-                return False
-
-            cmd = ["ffmpeg", "-i", input_path, "-map", "0", "-c", "copy"]
-
-            if self.cover_path:
-                cmd += [
-                    "-attach", self.cover_path,
-                    "-metadata:s:t:0", "mimetype=image/png",
-                ]
-
-            # Ensure metadata_args is a list
-            if not isinstance(metadata_args, list):
-                metadata_args = []
-
-            # ✅ Fix: concatenate properly as list
-            cmd = cmd + metadata_args + ["-f", "matroska", "-y", output_path]
-
-            success = await self.run_ffmpeg(cmd)
-
-            if success and os.path.exists(output_path):
-                LOGGER.info(f"✅ FFmpeg success → {output_path}")
-                return True
-            else:
-                LOGGER.error(f"❌ FFmpeg failed to create output file {output_path}")
-                return False
-        except Exception as e:
-            LOGGER.error(f"Error in copy_file_with_thumbnail: {e}")
-            return False
-
-    # ──────────────────────────────────────────────
-    async def process_video(self, file_path, metadata):
-        """
-        Process a video file by embedding metadata and optional cover image.
-        Output file is saved in the same directory as the input.
-        """
-        try:
-            input_dir = os.path.dirname(file_path)
-            base_name = os.path.basename(file_path)
-            processed_path = os.path.join(input_dir, f"processed_{base_name}")
-
-            # Prepare metadata arguments
-            metadata_args = []
-            for key, value in metadata.items():
-                if isinstance(value, (str, int, float)) and value:
-                    safe_value = str(value).replace('"', "'")
-                    metadata_args += ["-metadata", f"{key}={safe_value}"]
-
-            LOGGER.info(f"Starting video processing: {file_path} -> {processed_path}")
-            success = await self.copy_file_with_thumbnail(file_path, processed_path, metadata_args)
-
-            if success and os.path.exists(processed_path):
-                os.replace(processed_path, file_path)
-                LOGGER.info(f"✅ Processing complete: {file_path}")
-                return file_path
-            else:
-                LOGGER.warning(f"⚠️ Processing failed, returning original file: {file_path}")
-                return file_path
-        except Exception as e:
-            LOGGER.error(f"Error processing video file {file_path}: {e}")
-            return file_path
-
-    # ──────────────────────────────────────────────
-    def create_cover_image(self, text, output_path):
-        """Generate a fallback cover image if none exists."""
-        try:
-            img = Image.new("RGB", (600, 900), (20, 20, 20))
-            draw = ImageDraw.Draw(img)
-            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            font = ImageFont.truetype(font_path, 42)
-            w, h = draw.textsize(text, font=font)
-            draw.text(((600 - w) / 2, (900 - h) / 2), text, font=font, fill=(255, 255, 255))
-            img.save(output_path)
-            LOGGER.info(f"🖼️ Generated new cover image: {output_path}")
-            return output_path
-        except Exception as e:
-            LOGGER.error(f"Error creating cover image: {e}")
-            return None
-
-    # ──────────────────────────────────────────────
-    def sanitize_string(self, text):
-        """Remove unsafe filename characters."""
-        return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', text).strip()
-
-    # ──────────────────────────────────────────────
-    def cleanup_temp_dir(self, temp_dir):
-        """Safely delete temporary files and free memory."""
-        try:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                LOGGER.debug(f"🧹 Cleaned up temp dir: {temp_dir}")
-            gc.collect()
-        except Exception as e:
-            LOGGER.warning(f"Cleanup failed for {temp_dir}: {e}")
-            
-    
-            
-                             
 class TelegramUploader:
     def __init__(self, listener, path):
         self._last_uploaded = 0
@@ -339,10 +368,10 @@ class TelegramUploader:
                 cap_mono = f"{self._lprefix} {file_}"
             self._lprefix = re_sub("<.*?>", "", self._lprefix)
             new_path = ospath.join(dirpath, f"{self._lprefix} {file_}")
-            LOGGER.info(self._up_path)
+            LOGGER.info(f"Renaming file with prefix: {self._up_path} -> {new_path}")
             await rename(self._up_path, new_path)
             self._up_path = new_path
-            LOGGER.info(self._up_path)
+            LOGGER.info(f"New file path: {self._up_path}")
         if not self._lcaption and not self._lprefix:
             cap_mono = f"<code>{file_}</code>"
         if len(file_) > 60:
@@ -365,6 +394,7 @@ class TelegramUploader:
             remain = 60 - extn
             name = name[:remain]
             new_path = ospath.join(dirpath, f"{name}{ext}")
+            LOGGER.info(f"Truncating long filename: {self._up_path} -> {new_path}")
             await rename(self._up_path, new_path)
             self._up_path = new_path
         return cap_mono
@@ -375,123 +405,131 @@ class TelegramUploader:
         temp_dir = None
         temp_input_path = None
         processed_temp_path = None
-
+        
         try:
             if not file_path.lower().endswith(('.mkv', '.mp4')):
                 LOGGER.info(f"Skipping non-video file: {file_path}")
                 return file_path
 
             LOGGER.info(f"Intercepting video file for processing: {file_path}")
+            
+            # Verify original file exists before processing
+            if not await aiopath.exists(file_path):
+                LOGGER.error(f"Original file does not exist: {file_path}")
+                return file_path
 
             # Create a temporary directory for processing
             temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
-
+            LOGGER.info(f"Created temporary directory: {temp_dir}")
+            
             # Generate a sanitized filename with random numbers
             random_suffix = ''.join(random.choices('0123456789', k=8))
-            sanitized_name = f"Renamed-{random_suffix}{ospath.splitext(file_path)[1]}"
+            file_extension = ospath.splitext(file_path)[1]
+            sanitized_name = f"Renamed-{random_suffix}{file_extension}"
             temp_input_path = ospath.join(temp_dir, sanitized_name)
-
-            LOGGER.info(f"Copying original file to sanitized name: {temp_input_path}")
-
-            # Copy the original file to the temporary location with sanitized name
-            await asyncio.to_thread(shutil.copy2, file_path, temp_input_path)
-
+            
+            LOGGER.info(f"Copying original file to sanitized name: {file_path} -> {temp_input_path}")
+            
+            # Use aiofiles for async file operations to ensure proper copying
+            import aiofiles
+            async with aiofiles.open(file_path, 'rb') as src_file:
+                async with aiofiles.open(temp_input_path, 'wb') as dst_file:
+                    while True:
+                        chunk = await src_file.read(64 * 1024)  # 64KB chunks
+                        if not chunk:
+                            break
+                        await dst_file.write(chunk)
+            
             # Verify the copy was successful
             if not await aiopath.exists(temp_input_path):
                 raise Exception("Failed to copy file to temporary location")
-
+                
+            file_size = await aiopath.getsize(temp_input_path)
+            LOGGER.info(f"Successfully copied file. Size: {file_size} bytes")
+            
             # Create output path in the same temporary directory
             processed_temp_path = ospath.join(temp_dir, f"processed_{sanitized_name}")
-
+            
             # Define progress callback for video processing
             async def progress_callback(message):
                 LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
-
-            # Ensure temp_input_path exists before processing
-            if not await aiopath.exists(temp_input_path):
-                raise Exception(f"Temp input file missing before processing: {temp_input_path}")
-
-            output_dir = os.path.dirname(processed_temp_path)
-            if not await aiopath.exists(output_dir):
-                await asyncio.to_thread(os.makedirs, output_dir, exist_ok=True)
-                
+            
             # Process the video file using the sanitized temp file
             LOGGER.info(f"Starting video processing with sanitized filename: {temp_input_path} -> {processed_temp_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
                 temp_input_path, processed_temp_path, progress_callback
             )
-
+            
             if success:
                 if await aiopath.exists(processed_temp_path):
                     processed_size = await aiopath.getsize(processed_temp_path)
                     original_size = await aiopath.getsize(file_path)
                     LOGGER.info(f"Video processing successful: {file_path} -> {processed_temp_path} "
                                f"(Original: {original_size} bytes, Processed: {processed_size} bytes)")
-
+                    
                     # Remove original file and move processed file to original location
+                    LOGGER.info(f"Replacing original file with processed file: {file_path}")
                     await remove(file_path)
                     await rename(processed_temp_path, file_path)
                     LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
-
-                    # Clean up only after successful replacement
-                    if temp_input_path and await aiopath.exists(temp_input_path):
-                        await remove(temp_input_path)
-                    if temp_dir and await aiopath.exists(temp_dir):
-                        try:
-                            # Remove temp directory only if empty
-                            dir_contents = await asyncio.to_thread(os.listdir, temp_dir)
-                            if not dir_contents:
-                                await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-                            else:
-                                LOGGER.warning(f"Temporary directory not empty after rename: {temp_dir}")
-                        except Exception as e:
-                            LOGGER.warning(f"Error cleaning up temp directory {temp_dir}: {e}")
-
                     return file_path
                 else:
                     LOGGER.error(f"Processed file not found: {processed_temp_path}")
-                    # Cleanup temp files but keep original for fallback
-                    if temp_input_path and await aiopath.exists(temp_input_path):
-                        await remove(temp_input_path)
-                    if processed_temp_path and await aiopath.exists(processed_temp_path):
-                        await remove(processed_temp_path)
-                    if temp_dir and await aiopath.exists(temp_dir):
-                        try:
-                            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-                        except Exception:
-                            pass
                     return file_path
             else:
                 LOGGER.warning(f"Video processing failed, using original file: {file_path}")
-                # Clean up temp input only if exists
-                if temp_input_path and await aiopath.exists(temp_input_path):
-                    await remove(temp_input_path)
-                if processed_temp_path and await aiopath.exists(processed_temp_path):
-                    await remove(processed_temp_path)
-                if temp_dir and await aiopath.exists(temp_dir):
-                    try:
-                        await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
                 return file_path
-
+                
         except Exception as e:
-            LOGGER.error(f"Error processing video file {file_path}: {e}")
-            # Cleanup any temp files before returning original
-            if temp_input_path and await aiopath.exists(temp_input_path):
-                await remove(temp_input_path)
-            if processed_temp_path and await aiopath.exists(processed_temp_path):
-                await remove(processed_temp_path)
-            if temp_dir and await aiopath.exists(temp_dir):
-                try:
-                    await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            LOGGER.error(f"Error processing video file {file_path}: {str(e)}")
+            # If processing failed but we have the original file, return original path
             if await aiopath.exists(original_path):
+                LOGGER.info(f"Returning original file due to processing error: {original_path}")
                 return original_path
             else:
                 # If original was deleted but processing failed, this is critical
+                LOGGER.error(f"Processing failed and original file may be lost: {e}")
                 raise Exception(f"Processing failed and original file may be lost: {e}")
+        finally:
+            # Clean up temporary files and directory - BUT DON'T DELETE ORIGINAL FILES
+            cleanup_errors = []
+            try:
+                # Only clean up temporary files we created, not the original files
+                if temp_input_path and await aiopath.exists(temp_input_path):
+                    try:
+                        await remove(temp_input_path)
+                        LOGGER.info(f"Cleaned up temporary input file: {temp_input_path}")
+                    except Exception as e:
+                        cleanup_errors.append(f"Failed to remove temp_input_path: {e}")
+                
+                if processed_temp_path and await aiopath.exists(processed_temp_path):
+                    try:
+                        await remove(processed_temp_path)
+                        LOGGER.info(f"Cleaned up temporary processed file: {processed_temp_path}")
+                    except Exception as e:
+                        cleanup_errors.append(f"Failed to remove processed_temp_path: {e}")
+                
+                # Remove the temporary directory if it exists
+                if temp_dir and await aiopath.exists(temp_dir):
+                    try:
+                        # List contents to check if directory is empty
+                        try:
+                            dir_contents = await asyncio.to_thread(os.listdir, temp_dir)
+                            if not dir_contents:
+                                await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                                LOGGER.info(f"Cleaned up temporary directory: {temp_dir}")
+                            else:
+                                LOGGER.warning(f"Temporary directory not empty, keeping: {temp_dir}. Contents: {dir_contents}")
+                        except Exception as e:
+                            LOGGER.warning(f"Error listing directory contents {temp_dir}: {e}")
+                    except Exception as e:
+                        cleanup_errors.append(f"Failed to remove temp_dir: {e}")
+                
+                if cleanup_errors:
+                    LOGGER.warning(f"Cleanup errors: {'; '.join(cleanup_errors)}")
+                    
+            except Exception as e:
+                LOGGER.warning(f"Error during cleanup: {e}")
 
     def _get_input_media(self, subkey, key):
         rlist = []
@@ -556,6 +594,10 @@ class TelegramUploader:
         res = await self._msg_to_reply()
         if not res:
             return
+        
+        # Store all processed file paths to ensure they're not deleted prematurely
+        processed_files = set()
+        
         for dirpath, _, files in natsorted(await sync_to_async(walk, self._path)):
             if dirpath.strip().endswith("/yt-dlp-thumb"):
                 continue
@@ -566,6 +608,10 @@ class TelegramUploader:
             for file_ in natsorted(files):
                 self._error = ""
                 self._up_path = f_path = ospath.join(dirpath, file_)
+                
+                # Add to processed files set to track
+                processed_files.add(self._up_path)
+                
                 if not await aiopath.exists(self._up_path):
                     LOGGER.error(f"{self._up_path} not exists! Continue uploading!")
                     continue
@@ -582,12 +628,19 @@ class TelegramUploader:
                         return
                     cap_mono = await self._prepare_file(file_, dirpath)
                     
+                    # Update the path after preparation
+                    processed_files.add(self._up_path)
+                    
                     # Intercept and process MKV/MP4 files before upload
                     if self._up_path.lower().endswith(('.mkv', '.mp4')):
                         LOGGER.info(f"Intercepting video file for processing: {self._up_path}")
                         # Store original path for reference
                         original_path = self._up_path
+                        processed_files.add(original_path)
+                        
                         self._up_path = await self._process_video_file(self._up_path)
+                        # Update processed files with new path
+                        processed_files.add(self._up_path)
                         LOGGER.info(f"Video processing completed. Using file: {self._up_path}")
                     
                     if self._last_msg_in_group:
@@ -649,10 +702,20 @@ class TelegramUploader:
                     self._corrupted += 1
                     if self._listener.is_cancelled:
                         return
-                if not self._listener.is_cancelled and await aiopath.exists(
-                    self._up_path,
-                ):
-                    await remove(self._up_path)
+                # CRITICAL: Only remove file if it's not being used and upload is complete
+                # Remove this automatic deletion to prevent files from being deleted during processing
+                # if not self._listener.is_cancelled and await aiopath.exists(self._up_path):
+                #     await remove(self._up_path)
+        
+        # Clean up files only after all processing and uploading is complete
+        for file_path in processed_files:
+            if await aiopath.exists(file_path):
+                try:
+                    LOGGER.info(f"Cleaning up processed file: {file_path}")
+                    await remove(file_path)
+                except Exception as e:
+                    LOGGER.warning(f"Failed to clean up file {file_path}: {e}")
+        
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
                 if len(msgs) > 1:
@@ -698,6 +761,11 @@ class TelegramUploader:
         thumb = self._thumb
         self._is_corrupted = False
         try:
+            # Verify the file still exists before uploading
+            if not await aiopath.exists(self._up_path):
+                LOGGER.error(f"File to upload does not exist: {self._up_path}")
+                raise FileNotFoundError(f"File not found: {self._up_path}")
+
             is_video, is_audio, is_image = await get_document_type(self._up_path)
 
             if not is_image and thumb is None:
