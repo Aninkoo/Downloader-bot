@@ -14,6 +14,7 @@ from aiofiles.os import (
 from aiofiles.os import (
     remove,
     rename,
+    makedirs,
 )
 from aioshutil import rmtree
 from natsort import natsorted
@@ -201,16 +202,17 @@ class VideoProcessor:
             if not output_path.endswith('.mkv'):
                 output_path = ospath.splitext(output_path)[0] + '.mkv'
 
-            metadata_args = await self._build_stream_metadata_args(input_path)
+            # Ensure output directory exists
+            output_dir = ospath.dirname(output_path)
+            if not await aiopath.exists(output_dir):
+                await makedirs(output_dir, exist_ok=True)
+                LOGGER.info(f"Created output directory: {output_dir}")
 
-            # Escape file paths to handle special characters
-            escaped_input_path = shlex.quote(input_path)
-            escaped_output_path = shlex.quote(output_path)
-            escaped_cover_path = shlex.quote(self.cover_path) if await aiopath.exists(self.cover_path) else ""
+            metadata_args = await self._build_stream_metadata_args(input_path)
 
             # Build command with proper escaping
             cmd = [
-                'ffmpeg', '-i', input_path,  # Use original path, let subprocess handle escaping
+                'ffmpeg', '-i', input_path,
                 '-map', '0',
                 '-c', 'copy',
             ]
@@ -421,15 +423,25 @@ class TelegramUploader:
             input_size = await aiopath.getsize(file_path)
             LOGGER.info(f"Input file size: {input_size} bytes")
             
-            # Create a temporary output path with safe naming
-            base_name = ospath.splitext(file_path)[0]
-            # Remove any problematic characters from the processed filename
-            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
-            processed_path = f"{safe_base_name}_processed.mkv"
+            # Create processed file path in the same directory as original
+            file_dir = ospath.dirname(file_path)
+            file_name = ospath.basename(file_path)
+            base_name, ext = ospath.splitext(file_name)
             
+            # Create a safe filename for processed file
+            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
+            processed_path = ospath.join(file_dir, f"{safe_base_name}_processed.mkv")
+            
+            LOGGER.info(f"Processed file will be saved to: {processed_path}")
+            
+            # Ensure the directory exists
+            if not await aiopath.exists(file_dir):
+                await makedirs(file_dir, exist_ok=True)
+                LOGGER.info(f"Created directory: {file_dir}")
+
             # Define progress callback for video processing
             async def progress_callback(message):
-                LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
+                LOGGER.info(f"Video Processing [{file_name}]: {message}")
             
             # Process the video file
             LOGGER.info(f"Starting video processing: {file_path} -> {processed_path}")
@@ -443,7 +455,7 @@ class TelegramUploader:
                     LOGGER.info(f"Video processing successful: {file_path} -> {processed_path} "
                                f"(Original: {input_size} bytes, Processed: {processed_size} bytes)")
                     
-                    # Remove original file and rename processed file
+                    # Remove original file and rename processed file to original name
                     await remove(file_path)
                     await rename(processed_path, file_path)
                     LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
@@ -461,7 +473,11 @@ class TelegramUploader:
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {e}")
             # Clean up any partial processed file
-            processed_path = f"{re.sub(r'[^\w\-_.]', '_', ospath.splitext(file_path)[0])}_processed.mkv"
+            file_dir = ospath.dirname(file_path)
+            file_name = ospath.basename(file_path)
+            base_name, ext = ospath.splitext(file_name)
+            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
+            processed_path = ospath.join(file_dir, f"{safe_base_name}_processed.mkv")
             if await aiopath.exists(processed_path):
                 await remove(processed_path)
             return file_path
