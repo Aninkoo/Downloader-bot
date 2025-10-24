@@ -66,7 +66,7 @@ LOGGER = getLogger(__name__)
 
 class VideoProcessor:
     def __init__(self):
-        # Set cover image path
+        # Cover image path handling
         default_cover = os.path.join(os.path.dirname(__file__), "cover.png")
         alt_cover = "/usr/src/app/bot/helper/mirror_leech_utils/cover.png"
         self.cover_path = alt_cover if os.path.exists(alt_cover) else default_cover
@@ -77,7 +77,7 @@ class VideoProcessor:
 
     # ──────────────────────────────────────────────
     async def run_ffmpeg(self, cmd):
-        """Run FFmpeg asynchronously"""
+        """Run FFmpeg asynchronously and return success/failure."""
         try:
             LOGGER.info(f"▶️ FFmpeg command: {' '.join(cmd)}")
             process = await asyncio.create_subprocess_exec(
@@ -85,7 +85,7 @@ class VideoProcessor:
             )
             stdout, stderr = await process.communicate()
             if process.returncode != 0:
-                LOGGER.error(stderr.decode(errors="ignore"))
+                LOGGER.error(f"❌ FFmpeg failed: {stderr.decode(errors='ignore')}")
                 return False
             return True
         except Exception as e:
@@ -94,15 +94,15 @@ class VideoProcessor:
 
     # ──────────────────────────────────────────────
     async def extract_audio_track_info(self, file_path):
-        """Extract audio stream information from file"""
+        """Extract audio stream information."""
         try:
             probe = await asyncio.create_subprocess_exec(
-                'ffprobe', '-v', 'error', '-select_streams', 'a',
-                '-show_entries', 'stream=index:stream_tags=title,language',
-                '-of', 'json', file_path,
+                "ffprobe", "-v", "error", "-select_streams", "a",
+                "-show_entries", "stream=index:stream_tags=title,language",
+                "-of", "json", file_path,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            stdout, stderr = await probe.communicate()
+            stdout, _ = await probe.communicate()
             info = json.loads(stdout.decode())
             return info.get("streams", [])
         except Exception as e:
@@ -111,15 +111,15 @@ class VideoProcessor:
 
     # ──────────────────────────────────────────────
     async def extract_subtitle_info(self, file_path):
-        """Extract subtitle stream information"""
+        """Extract subtitle stream information."""
         try:
             probe = await asyncio.create_subprocess_exec(
-                'ffprobe', '-v', 'error', '-select_streams', 's',
-                '-show_entries', 'stream=index:stream_tags=title,language',
-                '-of', 'json', file_path,
+                "ffprobe", "-v", "error", "-select_streams", "s",
+                "-show_entries", "stream=index:stream_tags=title,language",
+                "-of", "json", file_path,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            stdout, stderr = await probe.communicate()
+            stdout, _ = await probe.communicate()
             info = json.loads(stdout.decode())
             return info.get("streams", [])
         except Exception as e:
@@ -128,41 +128,53 @@ class VideoProcessor:
 
     # ──────────────────────────────────────────────
     async def copy_file_with_thumbnail(self, input_path, output_path, metadata_args):
-        """Copy MKV while embedding cover and metadata"""
-        if not os.path.exists(input_path):
-            LOGGER.error(f"Input missing before FFmpeg: {input_path}")
-            return False
+        """
+        Copy the video with metadata and optional cover image.
+        """
+        try:
+            if not os.path.exists(input_path):
+                LOGGER.error(f"Input file missing before FFmpeg: {input_path}")
+                return False
 
-        cmd = ["ffmpeg", "-i", input_path, "-map", "0", "-c", "copy"]
+            cmd = ["ffmpeg", "-i", input_path, "-map", "0", "-c", "copy"]
 
-        if self.cover_path:
-            cmd += [
-                "-attach", self.cover_path,
-                "-metadata:s:t:0", "mimetype=image/png",
-            ]
+            if self.cover_path:
+                cmd += [
+                    "-attach", self.cover_path,
+                    "-metadata:s:t:0", "mimetype=image/png",
+                ]
 
-        cmd += metadata_args + ["-f", "matroska", "-y", output_path]
-        success = await self.run_ffmpeg(cmd)
+            # Ensure metadata_args is a list
+            if not isinstance(metadata_args, list):
+                metadata_args = []
 
-        if success and os.path.exists(output_path):
-            LOGGER.info(f"✅ FFmpeg success → {output_path}")
-            return True
-        else:
-            LOGGER.error(f"❌ FFmpeg did not produce {output_path}")
+            # ✅ Fix: concatenate properly as list
+            cmd = cmd + metadata_args + ["-f", "matroska", "-y", output_path]
+
+            success = await self.run_ffmpeg(cmd)
+
+            if success and os.path.exists(output_path):
+                LOGGER.info(f"✅ FFmpeg success → {output_path}")
+                return True
+            else:
+                LOGGER.error(f"❌ FFmpeg failed to create output file {output_path}")
+                return False
+        except Exception as e:
+            LOGGER.error(f"Error in copy_file_with_thumbnail: {e}")
             return False
 
     # ──────────────────────────────────────────────
     async def process_video(self, file_path, metadata):
         """
         Process a video file by embedding metadata and optional cover image.
-        Output will be saved in the same directory as the input.
+        Output file is saved in the same directory as the input.
         """
         try:
             input_dir = os.path.dirname(file_path)
             base_name = os.path.basename(file_path)
             processed_path = os.path.join(input_dir, f"processed_{base_name}")
 
-            # Prepare metadata
+            # Prepare metadata arguments
             metadata_args = []
             for key, value in metadata.items():
                 if isinstance(value, (str, int, float)) and value:
@@ -173,26 +185,24 @@ class VideoProcessor:
             success = await self.copy_file_with_thumbnail(file_path, processed_path, metadata_args)
 
             if success and os.path.exists(processed_path):
-                # Replace original file with processed version
                 os.replace(processed_path, file_path)
                 LOGGER.info(f"✅ Processing complete: {file_path}")
                 return file_path
             else:
-                LOGGER.warning(f"⚠️ Video processing failed, keeping original: {file_path}")
+                LOGGER.warning(f"⚠️ Processing failed, returning original file: {file_path}")
                 return file_path
-
         except Exception as e:
-            LOGGER.error(f"Error processing {file_path}: {e}")
+            LOGGER.error(f"Error processing video file {file_path}: {e}")
             return file_path
 
     # ──────────────────────────────────────────────
     def create_cover_image(self, text, output_path):
-        """Generate a fallback cover image with text"""
+        """Generate a fallback cover image if none exists."""
         try:
-            img = Image.new("RGB", (600, 900), (30, 30, 30))
+            img = Image.new("RGB", (600, 900), (20, 20, 20))
             draw = ImageDraw.Draw(img)
             font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            font = ImageFont.truetype(font_path, 40)
+            font = ImageFont.truetype(font_path, 42)
             w, h = draw.textsize(text, font=font)
             draw.text(((600 - w) / 2, (900 - h) / 2), text, font=font, fill=(255, 255, 255))
             img.save(output_path)
@@ -204,12 +214,12 @@ class VideoProcessor:
 
     # ──────────────────────────────────────────────
     def sanitize_string(self, text):
-        """Remove unsafe filename characters"""
+        """Remove unsafe filename characters."""
         return re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', text).strip()
 
     # ──────────────────────────────────────────────
     def cleanup_temp_dir(self, temp_dir):
-        """Safely delete temporary files"""
+        """Safely delete temporary files and free memory."""
         try:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -217,6 +227,7 @@ class VideoProcessor:
             gc.collect()
         except Exception as e:
             LOGGER.warning(f"Cleanup failed for {temp_dir}: {e}")
+            
     
             
                              
