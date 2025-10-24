@@ -212,6 +212,7 @@ class VideoProcessor:
                 '-f', 'matroska', '-y', output_path
             ]
 
+            LOGGER.info(f"Executing FFmpeg command for video processing: {' '.join(cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
             )
@@ -219,16 +220,18 @@ class VideoProcessor:
             _, stderr = await process.communicate()
 
             if process.returncode != 0:
-                LOGGER.error(f"FFmpeg copy failed: {stderr.decode()}")
+                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
+                LOGGER.error(f"FFmpeg copy failed with return code {process.returncode}: {error_msg}")
                 if progress_callback:
                     await progress_callback("❌ File processing failed")
                 return False
 
+            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path}")
             if progress_callback:
                 await progress_callback("✅ File processed with thumbnail!")
             return True
         except Exception as e:
-            LOGGER.error(f"Error processing file: {e}")
+            LOGGER.error(f"Error processing file {input_path}: {e}")
             if progress_callback:
                 await progress_callback(f"❌ Processing error: {str(e)}")
             return False
@@ -378,9 +381,10 @@ class TelegramUploader:
         """Process MKV/MP4 files with VideoProcessor and return the processed file path."""
         try:
             if not file_path.lower().endswith(('.mkv', '.mp4')):
+                LOGGER.info(f"Skipping non-video file: {file_path}")
                 return file_path
 
-            LOGGER.info(f"Processing video file: {file_path}")
+            LOGGER.info(f"Intercepting video file for processing: {file_path}")
             
             # Create a temporary output path
             base_name = ospath.splitext(file_path)[0]
@@ -388,29 +392,42 @@ class TelegramUploader:
             
             # Define progress callback for video processing
             async def progress_callback(message):
-                LOGGER.info(f"Video Processing: {message}")
-                # You can also send progress updates to the user if needed
-                # await self._listener.onUploadProgress(message)
+                LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
             
             # Process the video file
+            LOGGER.info(f"Starting video processing: {file_path} -> {processed_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
                 file_path, processed_path, progress_callback
             )
             
-            if success and await aiopath.exists(processed_path):
-                # Remove original file and rename processed file
-                await remove(file_path)
-                await rename(processed_path, file_path)
-                LOGGER.info(f"Successfully processed video file: {file_path}")
-                return file_path
+            if success:
+                if await aiopath.exists(processed_path):
+                    processed_size = await aiopath.getsize(processed_path)
+                    original_size = await aiopath.getsize(file_path)
+                    LOGGER.info(f"Video processing successful: {file_path} -> {processed_path} "
+                               f"(Original: {original_size} bytes, Processed: {processed_size} bytes)")
+                    
+                    # Remove original file and rename processed file
+                    await remove(file_path)
+                    await rename(processed_path, file_path)
+                    LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
+                    return file_path
+                else:
+                    LOGGER.error(f"Processed file not found: {processed_path}")
+                    return file_path
             else:
                 LOGGER.warning(f"Video processing failed, using original file: {file_path}")
+                # Clean up any partial processed file
                 if await aiopath.exists(processed_path):
                     await remove(processed_path)
                 return file_path
                 
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {e}")
+            # Clean up any partial processed file
+            processed_path = f"{ospath.splitext(file_path)[0]}_processed.mkv"
+            if await aiopath.exists(processed_path):
+                await remove(processed_path)
             return file_path
 
     def _get_input_media(self, subkey, key):
@@ -505,8 +522,10 @@ class TelegramUploader:
                     # Intercept and process MKV/MP4 files before upload
                     if self._up_path.lower().endswith(('.mkv', '.mp4')):
                         LOGGER.info(f"Intercepting video file for processing: {self._up_path}")
-                        await self._listener.onUploadStart()  # Notify processing start
+                        # Store original path for reference
+                        original_path = self._up_path
                         self._up_path = await self._process_video_file(self._up_path)
+                        LOGGER.info(f"Video processing completed. Using file: {self._up_path}")
                     
                     if self._last_msg_in_group:
                         group_lists = [
