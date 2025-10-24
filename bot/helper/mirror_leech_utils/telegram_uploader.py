@@ -6,6 +6,7 @@ from os import walk
 from re import match as re_match
 from re import sub as re_sub
 from time import time
+import shlex
 
 from aiofiles.os import (
     path as aiopath,
@@ -202,19 +203,32 @@ class VideoProcessor:
 
             metadata_args = await self._build_stream_metadata_args(input_path)
 
+            # Escape file paths to handle special characters
+            escaped_input_path = shlex.quote(input_path)
+            escaped_output_path = shlex.quote(output_path)
+            escaped_cover_path = shlex.quote(self.cover_path) if await aiopath.exists(self.cover_path) else ""
+
+            # Build command with proper escaping
             cmd = [
-                'ffmpeg', '-i', input_path,
+                'ffmpeg', '-i', input_path,  # Use original path, let subprocess handle escaping
                 '-map', '0',
                 '-c', 'copy',
-                '-attach', self.cover_path,
-                '-metadata:s:t:0', 'mimetype=image/png',
-                *metadata_args,
-                '-f', 'matroska', '-y', output_path
             ]
+            
+            # Only add cover if it exists
+            if await aiopath.exists(self.cover_path):
+                cmd += ['-attach', self.cover_path, '-metadata:s:t:0', 'mimetype=image/png']
+            
+            cmd += metadata_args + ['-f', 'matroska', '-y', output_path]
 
             LOGGER.info(f"Executing FFmpeg command for video processing: {' '.join(cmd)}")
+            
+            # Use shell=False but let subprocess handle the arguments
             process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
+                *cmd, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.PIPE, 
+                start_new_session=True
             )
 
             _, stderr = await process.communicate()
@@ -222,11 +236,24 @@ class VideoProcessor:
             if process.returncode != 0:
                 error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
                 LOGGER.error(f"FFmpeg copy failed with return code {process.returncode}: {error_msg}")
+                
+                # Check if input file exists
+                if not await aiopath.exists(input_path):
+                    LOGGER.error(f"Input file does not exist: {input_path}")
                 if progress_callback:
                     await progress_callback("❌ File processing failed")
                 return False
 
-            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path}")
+            # Verify output file was created
+            if not await aiopath.exists(output_path):
+                LOGGER.error(f"Output file was not created: {output_path}")
+                if progress_callback:
+                    await progress_callback("❌ Output file not created")
+                return False
+
+            output_size = await aiopath.getsize(output_path)
+            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path} ({output_size} bytes)")
+            
             if progress_callback:
                 await progress_callback("✅ File processed with thumbnail!")
             return True
@@ -386,9 +413,19 @@ class TelegramUploader:
 
             LOGGER.info(f"Intercepting video file for processing: {file_path}")
             
-            # Create a temporary output path
+            # Verify input file exists and is accessible
+            if not await aiopath.exists(file_path):
+                LOGGER.error(f"Input file does not exist: {file_path}")
+                return file_path
+            
+            input_size = await aiopath.getsize(file_path)
+            LOGGER.info(f"Input file size: {input_size} bytes")
+            
+            # Create a temporary output path with safe naming
             base_name = ospath.splitext(file_path)[0]
-            processed_path = f"{base_name}_processed.mkv"
+            # Remove any problematic characters from the processed filename
+            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
+            processed_path = f"{safe_base_name}_processed.mkv"
             
             # Define progress callback for video processing
             async def progress_callback(message):
@@ -403,9 +440,8 @@ class TelegramUploader:
             if success:
                 if await aiopath.exists(processed_path):
                     processed_size = await aiopath.getsize(processed_path)
-                    original_size = await aiopath.getsize(file_path)
                     LOGGER.info(f"Video processing successful: {file_path} -> {processed_path} "
-                               f"(Original: {original_size} bytes, Processed: {processed_size} bytes)")
+                               f"(Original: {input_size} bytes, Processed: {processed_size} bytes)")
                     
                     # Remove original file and rename processed file
                     await remove(file_path)
@@ -425,7 +461,7 @@ class TelegramUploader:
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {e}")
             # Clean up any partial processed file
-            processed_path = f"{ospath.splitext(file_path)[0]}_processed.mkv"
+            processed_path = f"{re.sub(r'[^\w\-_.]', '_', ospath.splitext(file_path)[0])}_processed.mkv"
             if await aiopath.exists(processed_path):
                 await remove(processed_path)
             return file_path
