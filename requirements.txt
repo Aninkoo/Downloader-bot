@@ -36,3 +36,8 @@ uvicorn
 uvloop
 xattr
 yt-dlp[default,curl-cffi]
+
+
+ffmpeg-python==0.2.0
+python-dotenv==1.0.0
+patool==1.12
