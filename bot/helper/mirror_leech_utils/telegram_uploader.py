@@ -1,6 +1,7 @@
 import contextlib
 from asyncio import sleep
 from logging import getLogger
+import os
 from os import path as ospath
 from os import walk
 from re import match as re_match
@@ -420,6 +421,10 @@ class TelegramUploader:
             if not await aiopath.exists(temp_input_path):
                 raise Exception(f"Temp input file missing before processing: {temp_input_path}")
 
+            output_dir = os.path.dirname(processed_temp_path)
+            if not await aiopath.exists(output_dir):
+                await asyncio.to_thread(os.makedirs, output_dir, exist_ok=True)
+                
             # Process the video file using the sanitized temp file
             LOGGER.info(f"Starting video processing with sanitized filename: {temp_input_path} -> {processed_temp_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
