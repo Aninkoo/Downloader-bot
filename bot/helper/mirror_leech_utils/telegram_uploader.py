@@ -384,92 +384,119 @@ class TelegramUploader:
         temp_dir = None
         temp_input_path = None
         processed_temp_path = None
-        
+
         try:
             if not file_path.lower().endswith(('.mkv', '.mp4')):
                 LOGGER.info(f"Skipping non-video file: {file_path}")
                 return file_path
 
             LOGGER.info(f"Intercepting video file for processing: {file_path}")
-            
+
             # Create a temporary directory for processing
             temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
-            
+
             # Generate a sanitized filename with random numbers
             random_suffix = ''.join(random.choices('0123456789', k=8))
             sanitized_name = f"Renamed-{random_suffix}{ospath.splitext(file_path)[1]}"
             temp_input_path = ospath.join(temp_dir, sanitized_name)
-            
+
             LOGGER.info(f"Copying original file to sanitized name: {temp_input_path}")
-            
+
             # Copy the original file to the temporary location with sanitized name
             await asyncio.to_thread(shutil.copy2, file_path, temp_input_path)
-            
+
             # Verify the copy was successful
             if not await aiopath.exists(temp_input_path):
                 raise Exception("Failed to copy file to temporary location")
-                
+
             # Create output path in the same temporary directory
             processed_temp_path = ospath.join(temp_dir, f"processed_{sanitized_name}")
-            
+
             # Define progress callback for video processing
             async def progress_callback(message):
                 LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
-            
+
+            # Ensure temp_input_path exists before processing
+            if not await aiopath.exists(temp_input_path):
+                raise Exception(f"Temp input file missing before processing: {temp_input_path}")
+
             # Process the video file using the sanitized temp file
             LOGGER.info(f"Starting video processing with sanitized filename: {temp_input_path} -> {processed_temp_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
                 temp_input_path, processed_temp_path, progress_callback
             )
-            
+
             if success:
                 if await aiopath.exists(processed_temp_path):
                     processed_size = await aiopath.getsize(processed_temp_path)
                     original_size = await aiopath.getsize(file_path)
                     LOGGER.info(f"Video processing successful: {file_path} -> {processed_temp_path} "
                                f"(Original: {original_size} bytes, Processed: {processed_size} bytes)")
-                    
+
                     # Remove original file and move processed file to original location
                     await remove(file_path)
                     await rename(processed_temp_path, file_path)
                     LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
+
+                    # Clean up only after successful replacement
+                    if temp_input_path and await aiopath.exists(temp_input_path):
+                        await remove(temp_input_path)
+                    if temp_dir and await aiopath.exists(temp_dir):
+                        try:
+                            # Remove temp directory only if empty
+                            dir_contents = await asyncio.to_thread(os.listdir, temp_dir)
+                            if not dir_contents:
+                                await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                            else:
+                                LOGGER.warning(f"Temporary directory not empty after rename: {temp_dir}")
+                        except Exception as e:
+                            LOGGER.warning(f"Error cleaning up temp directory {temp_dir}: {e}")
+
                     return file_path
                 else:
                     LOGGER.error(f"Processed file not found: {processed_temp_path}")
+                    # Cleanup temp files but keep original for fallback
+                    if temp_input_path and await aiopath.exists(temp_input_path):
+                        await remove(temp_input_path)
+                    if processed_temp_path and await aiopath.exists(processed_temp_path):
+                        await remove(processed_temp_path)
+                    if temp_dir and await aiopath.exists(temp_dir):
+                        try:
+                            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                        except Exception:
+                            pass
                     return file_path
             else:
                 LOGGER.warning(f"Video processing failed, using original file: {file_path}")
+                # Clean up temp input only if exists
+                if temp_input_path and await aiopath.exists(temp_input_path):
+                    await remove(temp_input_path)
+                if processed_temp_path and await aiopath.exists(processed_temp_path):
+                    await remove(processed_temp_path)
+                if temp_dir and await aiopath.exists(temp_dir):
+                    try:
+                        await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
                 return file_path
-                
+
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {e}")
-            # If processing failed but we have the original file, return original path
+            # Cleanup any temp files before returning original
+            if temp_input_path and await aiopath.exists(temp_input_path):
+                await remove(temp_input_path)
+            if processed_temp_path and await aiopath.exists(processed_temp_path):
+                await remove(processed_temp_path)
+            if temp_dir and await aiopath.exists(temp_dir):
+                try:
+                    await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
             if await aiopath.exists(original_path):
                 return original_path
             else:
                 # If original was deleted but processing failed, this is critical
                 raise Exception(f"Processing failed and original file may be lost: {e}")
-        finally:
-            # Clean up temporary files and directory
-            try:
-                if temp_input_path and await aiopath.exists(temp_input_path):
-                    await remove(temp_input_path)
-                if processed_temp_path and await aiopath.exists(processed_temp_path):
-                    await remove(processed_temp_path)
-                
-                # Remove the temporary directory if it exists and is empty
-                if temp_dir and await aiopath.exists(temp_dir):
-                    try:
-                        # Check if directory is empty before removing
-                        dir_contents = await asyncio.to_thread(os.listdir, temp_dir)
-                        if not dir_contents:
-                            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
-                        else:
-                            LOGGER.warning(f"Temporary directory not empty, keeping: {temp_dir}")
-                    except Exception as e:
-                        LOGGER.warning(f"Error cleaning up temp directory {temp_dir}: {e}")
-            except Exception as e:
-                LOGGER.warning(f"Error during cleanup: {e}")
 
     def _get_input_media(self, subkey, key):
         rlist = []
