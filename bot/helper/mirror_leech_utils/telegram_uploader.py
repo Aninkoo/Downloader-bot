@@ -6,7 +6,6 @@ from os import walk
 from re import match as re_match
 from re import sub as re_sub
 from time import time
-import shlex
 
 from aiofiles.os import (
     path as aiopath,
@@ -14,7 +13,6 @@ from aiofiles.os import (
 from aiofiles.os import (
     remove,
     rename,
-    makedirs,
 )
 from aioshutil import rmtree
 from natsort import natsorted
@@ -61,6 +59,7 @@ import tempfile
 import shutil
 import re
 import gc
+import random
 
 LOGGER = getLogger(__name__)
 
@@ -202,35 +201,21 @@ class VideoProcessor:
             if not output_path.endswith('.mkv'):
                 output_path = ospath.splitext(output_path)[0] + '.mkv'
 
-            # Ensure output directory exists
-            output_dir = ospath.dirname(output_path)
-            if not await aiopath.exists(output_dir):
-                await makedirs(output_dir, exist_ok=True)
-                LOGGER.info(f"Created output directory: {output_dir}")
-
             metadata_args = await self._build_stream_metadata_args(input_path)
 
-            # Build command with proper escaping
             cmd = [
                 'ffmpeg', '-i', input_path,
                 '-map', '0',
                 '-c', 'copy',
+                '-attach', self.cover_path,
+                '-metadata:s:t:0', 'mimetype=image/png',
+                *metadata_args,
+                '-f', 'matroska', '-y', output_path
             ]
-            
-            # Only add cover if it exists
-            if await aiopath.exists(self.cover_path):
-                cmd += ['-attach', self.cover_path, '-metadata:s:t:0', 'mimetype=image/png']
-            
-            cmd += metadata_args + ['-f', 'matroska', '-y', output_path]
 
             LOGGER.info(f"Executing FFmpeg command for video processing: {' '.join(cmd)}")
-            
-            # Use shell=False but let subprocess handle the arguments
             process = await asyncio.create_subprocess_exec(
-                *cmd, 
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.PIPE, 
-                start_new_session=True
+                *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True
             )
 
             _, stderr = await process.communicate()
@@ -238,24 +223,11 @@ class VideoProcessor:
             if process.returncode != 0:
                 error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
                 LOGGER.error(f"FFmpeg copy failed with return code {process.returncode}: {error_msg}")
-                
-                # Check if input file exists
-                if not await aiopath.exists(input_path):
-                    LOGGER.error(f"Input file does not exist: {input_path}")
                 if progress_callback:
                     await progress_callback("❌ File processing failed")
                 return False
 
-            # Verify output file was created
-            if not await aiopath.exists(output_path):
-                LOGGER.error(f"Output file was not created: {output_path}")
-                if progress_callback:
-                    await progress_callback("❌ Output file not created")
-                return False
-
-            output_size = await aiopath.getsize(output_path)
-            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path} ({output_size} bytes)")
-            
+            LOGGER.info(f"Successfully processed video file: {input_path} -> {output_path}")
             if progress_callback:
                 await progress_callback("✅ File processed with thumbnail!")
             return True
@@ -408,6 +380,11 @@ class TelegramUploader:
 
     async def _process_video_file(self, file_path: str) -> str:
         """Process MKV/MP4 files with VideoProcessor and return the processed file path."""
+        original_path = file_path
+        temp_dir = None
+        temp_input_path = None
+        processed_temp_path = None
+        
         try:
             if not file_path.lower().endswith(('.mkv', '.mp4')):
                 LOGGER.info(f"Skipping non-video file: {file_path}")
@@ -415,72 +392,84 @@ class TelegramUploader:
 
             LOGGER.info(f"Intercepting video file for processing: {file_path}")
             
-            # Verify input file exists and is accessible
-            if not await aiopath.exists(file_path):
-                LOGGER.error(f"Input file does not exist: {file_path}")
-                return file_path
+            # Create a temporary directory for processing
+            temp_dir = await asyncio.to_thread(tempfile.mkdtemp)
             
-            input_size = await aiopath.getsize(file_path)
-            LOGGER.info(f"Input file size: {input_size} bytes")
+            # Generate a sanitized filename with random numbers
+            random_suffix = ''.join(random.choices('0123456789', k=8))
+            sanitized_name = f"Renamed-{random_suffix}{ospath.splitext(file_path)[1]}"
+            temp_input_path = ospath.join(temp_dir, sanitized_name)
             
-            # Create processed file path in the same directory as original
-            file_dir = ospath.dirname(file_path)
-            file_name = ospath.basename(file_path)
-            base_name, ext = ospath.splitext(file_name)
+            LOGGER.info(f"Copying original file to sanitized name: {temp_input_path}")
             
-            # Create a safe filename for processed file
-            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
-            processed_path = ospath.join(file_dir, f"{safe_base_name}_processed.mkv")
+            # Copy the original file to the temporary location with sanitized name
+            await asyncio.to_thread(shutil.copy2, file_path, temp_input_path)
             
-            LOGGER.info(f"Processed file will be saved to: {processed_path}")
+            # Verify the copy was successful
+            if not await aiopath.exists(temp_input_path):
+                raise Exception("Failed to copy file to temporary location")
+                
+            # Create output path in the same temporary directory
+            processed_temp_path = ospath.join(temp_dir, f"processed_{sanitized_name}")
             
-            # Ensure the directory exists
-            if not await aiopath.exists(file_dir):
-                await makedirs(file_dir, exist_ok=True)
-                LOGGER.info(f"Created directory: {file_dir}")
-
             # Define progress callback for video processing
             async def progress_callback(message):
-                LOGGER.info(f"Video Processing [{file_name}]: {message}")
+                LOGGER.info(f"Video Processing [{ospath.basename(file_path)}]: {message}")
             
-            # Process the video file
-            LOGGER.info(f"Starting video processing: {file_path} -> {processed_path}")
+            # Process the video file using the sanitized temp file
+            LOGGER.info(f"Starting video processing with sanitized filename: {temp_input_path} -> {processed_temp_path}")
             success = await self.video_processor.copy_file_with_thumbnail(
-                file_path, processed_path, progress_callback
+                temp_input_path, processed_temp_path, progress_callback
             )
             
             if success:
-                if await aiopath.exists(processed_path):
-                    processed_size = await aiopath.getsize(processed_path)
-                    LOGGER.info(f"Video processing successful: {file_path} -> {processed_path} "
-                               f"(Original: {input_size} bytes, Processed: {processed_size} bytes)")
+                if await aiopath.exists(processed_temp_path):
+                    processed_size = await aiopath.getsize(processed_temp_path)
+                    original_size = await aiopath.getsize(file_path)
+                    LOGGER.info(f"Video processing successful: {file_path} -> {processed_temp_path} "
+                               f"(Original: {original_size} bytes, Processed: {processed_size} bytes)")
                     
-                    # Remove original file and rename processed file to original name
+                    # Remove original file and move processed file to original location
                     await remove(file_path)
-                    await rename(processed_path, file_path)
+                    await rename(processed_temp_path, file_path)
                     LOGGER.info(f"Successfully replaced original file with processed file: {file_path}")
                     return file_path
                 else:
-                    LOGGER.error(f"Processed file not found: {processed_path}")
+                    LOGGER.error(f"Processed file not found: {processed_temp_path}")
                     return file_path
             else:
                 LOGGER.warning(f"Video processing failed, using original file: {file_path}")
-                # Clean up any partial processed file
-                if await aiopath.exists(processed_path):
-                    await remove(processed_path)
                 return file_path
                 
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {e}")
-            # Clean up any partial processed file
-            file_dir = ospath.dirname(file_path)
-            file_name = ospath.basename(file_path)
-            base_name, ext = ospath.splitext(file_name)
-            safe_base_name = re.sub(r'[^\w\-_.]', '_', base_name)
-            processed_path = ospath.join(file_dir, f"{safe_base_name}_processed.mkv")
-            if await aiopath.exists(processed_path):
-                await remove(processed_path)
-            return file_path
+            # If processing failed but we have the original file, return original path
+            if await aiopath.exists(original_path):
+                return original_path
+            else:
+                # If original was deleted but processing failed, this is critical
+                raise Exception(f"Processing failed and original file may be lost: {e}")
+        finally:
+            # Clean up temporary files and directory
+            try:
+                if temp_input_path and await aiopath.exists(temp_input_path):
+                    await remove(temp_input_path)
+                if processed_temp_path and await aiopath.exists(processed_temp_path):
+                    await remove(processed_temp_path)
+                
+                # Remove the temporary directory if it exists and is empty
+                if temp_dir and await aiopath.exists(temp_dir):
+                    try:
+                        # Check if directory is empty before removing
+                        dir_contents = await asyncio.to_thread(os.listdir, temp_dir)
+                        if not dir_contents:
+                            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+                        else:
+                            LOGGER.warning(f"Temporary directory not empty, keeping: {temp_dir}")
+                    except Exception as e:
+                        LOGGER.warning(f"Error cleaning up temp directory {temp_dir}: {e}")
+            except Exception as e:
+                LOGGER.warning(f"Error during cleanup: {e}")
 
     def _get_input_media(self, subkey, key):
         rlist = []
