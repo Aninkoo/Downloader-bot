@@ -413,18 +413,18 @@ class TelegramUploader:
                 LOGGER.error(f"Original file does not exist: {file_path}")
                 return file_path
 
-            # Generate a sanitized filename with random numbers in the SAME directory
-            dir_path = ospath.dirname(file_path)
+            # Generate a sanitized filename with random numbers in /usr/src/app/downloads
+            downloads_dir = "/usr/src/app/downloads"
             base_name = ospath.splitext(ospath.basename(file_path))[0]
             random_suffix = ''.join(random.choices('0123456789', k=8))
             
-            # Create sanitized input filename in the same directory
+            # Create sanitized input filename in downloads directory
             sanitized_input_name = f"temp_input_{random_suffix}.mkv"
-            temp_input_path = ospath.join(dir_path, sanitized_input_name)
+            temp_input_path = ospath.join(downloads_dir, sanitized_input_name)
             
-            # Create output filename in the same directory
+            # Create output filename in downloads directory
             processed_output_name = f"temp_processed_{random_suffix}.mkv"
-            processed_output_path = ospath.join(dir_path, processed_output_name)
+            processed_output_path = ospath.join(downloads_dir, processed_output_name)
             
             LOGGER.info(f"Copying original file to sanitized name: {file_path} -> {temp_input_path}")
             
@@ -482,13 +482,13 @@ class TelegramUploader:
                 
         except Exception as e:
             LOGGER.error(f"Error processing video file {file_path}: {str(e)}")
-            # Clean up any temporary files that might have been created
+            # Clean up any temporary files that might have been created in downloads directory
             try:
-                dir_path = ospath.dirname(file_path)
-                temp_files = [f for f in await asyncio.to_thread(os.listdir, dir_path) 
+                downloads_dir = "/usr/src/app/downloads"
+                temp_files = [f for f in await asyncio.to_thread(os.listdir, downloads_dir) 
                              if f.startswith('temp_') and f.endswith('.mkv')]
                 for temp_file in temp_files:
-                    temp_path = ospath.join(dir_path, temp_file)
+                    temp_path = ospath.join(downloads_dir, temp_file)
                     if await aiopath.exists(temp_path):
                         await remove(temp_path)
                         LOGGER.info(f"Cleaned up temporary file: {temp_path}")
