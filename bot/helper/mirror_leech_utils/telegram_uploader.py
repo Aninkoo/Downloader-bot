@@ -6,6 +6,7 @@ from os import walk
 from re import match as re_match
 from re import sub as re_sub
 from time import time
+import shutil
 
 from aiofiles.os import (
     path as aiopath,
@@ -76,6 +77,8 @@ class TelegramUploader:
         self.log_msg = None
         self._user_session = self._listener.user_transmission
         self._error = ""
+        # Add shared directory path
+        self._shared_dir = "/data/shared"
 
     async def _upload_progress(self, current, _):
         if self._listener.is_cancelled:
@@ -244,6 +247,46 @@ class TelegramUploader:
                 self._msgs_dict[m.link] = m.caption
         self._sent_msg = msgs_list[-1]
 
+
+    async def _store_file_locally(self, file_path, cap_mono):
+        """Store file in shared directory and simulate successful upload"""
+        try:
+            # Ensure shared directory exists with proper permissions
+            if not await aiopath.exists(self._shared_dir):
+                await sync_to_async(shutil.os.makedirs, self._shared_dir, mode=0o755, exist_ok=True)
+        
+            # Copy file to shared directory
+            filename = ospath.basename(file_path)
+            shared_path = ospath.join(self._shared_dir, filename)
+            await sync_to_async(shutil.copy2, file_path, shared_path)
+        
+            LOGGER.info(f"File stored locally in shared directory: {shared_path}")
+        
+            # Simulate upload progress
+            file_size = await aiopath.getsize(file_path)
+            self._processed_bytes += file_size
+        
+            # Create a mock message object to simulate successful upload
+            class MockMessage:
+                def __init__(self):
+                    self.link = f"local://{shared_path}"
+                    self.caption = cap_mono
+                    self.chat = type('Chat', (), {'id': self._user_id})()
+                    self.id = int(time() * 1000)
+        
+            self._sent_msg = MockMessage()
+        
+            # Store in msgs_dict as if it was uploaded
+            if self._listener.is_super_chat or self._listener.up_dest:
+                self._msgs_dict[self._sent_msg.link] = filename
+        
+            return True
+        
+        except Exception as e:
+            LOGGER.error(f"Failed to store file locally: {e}")
+            return False
+
+
     async def upload(self):
         await self._user_settings()
         res = await self._msg_to_reply()
@@ -312,15 +355,15 @@ class TelegramUploader:
                             )
                     self._last_msg_in_group = False
                     self._last_uploaded = 0
-                    await self._upload_file(cap_mono, file_, f_path)
+                    
+                    # Store file locally instead of uploading to Telegram
+                    success = await self._store_file_locally(self._up_path, cap_mono)
+                    if not success:
+                        self._corrupted += 1
+                        continue
+                    
                     if self._listener.is_cancelled:
                         return
-                    if (
-                        not self._is_corrupted
-                        and (self._listener.is_super_chat or self._listener.up_dest)
-                        and not self._is_private
-                    ):
-                        self._msgs_dict[self._sent_msg.link] = file_
                     await sleep(1)
                 except Exception as err:
                     if isinstance(err, RetryError):
@@ -337,6 +380,8 @@ class TelegramUploader:
                     self._up_path,
                 ):
                     await remove(self._up_path)
+        
+        # Clean up any remaining media groups
         for key, value in list(self._media_dict.items()):
             for subkey, msgs in list(value.items()):
                 if len(msgs) > 1:
@@ -346,19 +391,23 @@ class TelegramUploader:
                         LOGGER.info(
                             f"While sending media group at the end of task. Error: {e}",
                         )
+        
         if self._listener.is_cancelled:
             return
+        
         if self._total_files == 0:
             await self._listener.on_upload_error(
                 "No files to upload. In case you have filled EXCLUDED_EXTENSIONS, then check if all files have those extensions or not.",
             )
             return
+        
         if self._total_files <= self._corrupted:
             await self._listener.on_upload_error(
                 f"Files Corrupted or unable to upload. {self._error or 'Check logs!'}",
             )
             return
-        LOGGER.info(f"Leech Completed: {self._listener.name}")
+        
+        LOGGER.info(f"Local Storage Completed: {self._listener.name}")
         await self._listener.on_upload_complete(
             None,
             self._msgs_dict,
@@ -373,194 +422,15 @@ class TelegramUploader:
         retry=retry_if_exception_type(Exception),
     )
     async def _upload_file(self, cap_mono, file, o_path, force_document=False):
-        if (
-            self._thumb is not None
-            and not await aiopath.exists(self._thumb)
-            and self._thumb != "none"
-        ):
-            self._thumb = None
-        thumb = self._thumb
-        self._is_corrupted = False
-        try:
-            is_video, is_audio, is_image = await get_document_type(self._up_path)
-
-            if not is_image and thumb is None:
-                file_name = ospath.splitext(file)[0]
-                thumb_path = f"{self._path}/yt-dlp-thumb/{file_name}.jpg"
-                if await aiopath.isfile(thumb_path):
-                    thumb = thumb_path
-                elif is_audio and not is_video:
-                    thumb = await get_audio_thumbnail(self._up_path)
-
-            if (
-                self._listener.as_doc
-                or force_document
-                or (not is_video and not is_audio and not is_image)
-            ):
-                key = "documents"
-                if is_video and thumb is None:
-                    thumb = await get_video_thumbnail(self._up_path, None)
-
-                if self._listener.is_cancelled:
-                    return None
-                if thumb == "none":
-                    thumb = None
-                self._sent_msg = await self._sent_msg.reply_document(
-                    document=self._up_path,
-                    quote=True,
-                    thumb=thumb,
-                    caption=cap_mono,
-                    force_document=True,
-                    disable_notification=True,
-                    progress=self._upload_progress,
-                )
-            elif is_video:
-                key = "videos"
-                duration = (await get_media_info(self._up_path))[0]
-                if thumb is None and self._listener.thumbnail_layout:
-                    thumb = await get_multiple_frames_thumbnail(
-                        self._up_path,
-                        self._listener.thumbnail_layout,
-                        self._listener.screen_shots,
-                    )
-                if thumb is None:
-                    thumb = await get_video_thumbnail(self._up_path, duration)
-                if thumb is not None and thumb != "none":
-                    with Image.open(thumb) as img:
-                        width, height = img.size
-                else:
-                    width = 480
-                    height = 320
-                if self._listener.is_cancelled:
-                    return None
-                if thumb == "none":
-                    thumb = None
-                self._sent_msg = await self._sent_msg.reply_video(
-                    video=self._up_path,
-                    quote=True,
-                    caption=cap_mono,
-                    duration=duration,
-                    width=width,
-                    height=height,
-                    thumb=thumb,
-                    supports_streaming=True,
-                    disable_notification=True,
-                    progress=self._upload_progress,
-                )
-            elif is_audio:
-                key = "audios"
-                duration, artist, title = await get_media_info(self._up_path)
-                if self._listener.is_cancelled:
-                    return None
-                self._sent_msg = await self._sent_msg.reply_audio(
-                    audio=self._up_path,
-                    quote=True,
-                    caption=cap_mono,
-                    duration=duration,
-                    performer=artist,
-                    title=title,
-                    thumb=thumb,
-                    disable_notification=True,
-                    progress=self._upload_progress,
-                )
-            else:
-                key = "photos"
-                if self._listener.is_cancelled:
-                    return None
-                self._sent_msg = await self._sent_msg.reply_photo(
-                    photo=self._up_path,
-                    quote=True,
-                    caption=cap_mono,
-                    disable_notification=True,
-                    progress=self._upload_progress,
-                )
-
-            await self._copy_message()
-
-            if (
-                not self._listener.is_cancelled
-                and self._media_group
-                and (self._sent_msg.video or self._sent_msg.document)
-            ):
-                key = "documents" if self._sent_msg.document else "videos"
-                if match := re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", o_path):
-                    pname = match.group(0)
-                    if pname in self._media_dict[key]:
-                        self._media_dict[key][pname].append(
-                            [self._sent_msg.chat.id, self._sent_msg.id],
-                        )
-                    else:
-                        self._media_dict[key][pname] = [
-                            [self._sent_msg.chat.id, self._sent_msg.id],
-                        ]
-                    msgs = self._media_dict[key][pname]
-                    if len(msgs) == 10:
-                        await self._send_media_group(pname, key, msgs)
-                    else:
-                        self._last_msg_in_group = True
-
-            if (
-                self._thumb is None
-                and thumb is not None
-                and await aiopath.exists(thumb)
-            ):
-                await remove(thumb)
-        except (FloodWait, FloodPremiumWait) as f:
-            LOGGER.warning(str(f))
-            await sleep(f.value * 1.3)
-            if (
-                self._thumb is None
-                and thumb is not None
-                and await aiopath.exists(thumb)
-            ):
-                await remove(thumb)
-            return await self._upload_file(cap_mono, file, o_path)
-        except Exception as err:
-            if (
-                self._thumb is None
-                and thumb is not None
-                and await aiopath.exists(thumb)
-            ):
-                await remove(thumb)
-            err_type = "RPCError: " if isinstance(err, RPCError) else ""
-            LOGGER.error(f"{err_type}{err}. Path: {self._up_path}")
-            if isinstance(err, BadRequest) and key != "documents":
-                LOGGER.error(f"Retrying As Document. Path: {self._up_path}")
-                return await self._upload_file(cap_mono, file, o_path, True)
-            raise err
+        """Modified to store files locally instead of uploading to Telegram"""
+        success = await self._store_file_locally(o_path, cap_mono)
+        if not success:
+            raise Exception("Failed to store file locally")
 
     async def _copy_message(self):
+        """Mock the copy message function - do nothing since we're not actually uploading"""
         await sleep(0.5)
-
-        async def _copy(target, retries=2):
-            for attempt in range(retries):
-                try:
-                    msg = await TgClient.bot.get_messages(
-                        self._sent_msg.chat.id,
-                        self._sent_msg.id,
-                    )
-                    await msg.copy(target)
-                    return
-                except Exception as e:
-                    LOGGER.error(f"Attempt {attempt + 1} failed: {e} {msg.id}")
-                    if attempt < retries - 1:
-                        await sleep(0.5)
-            LOGGER.error(f"Failed to copy message after {retries} attempts")
-
-        # TODO if self.dm_mode:
-        if self._sent_msg.chat.id != self._user_id:
-            await _copy(self._user_id)
-
-        if self._user_dump:
-            with contextlib.suppress(Exception):
-                await _copy(int(self._user_dump))
-        if (
-            isinstance(Config.LEECH_DUMP_CHAT, list)
-            and len(Config.LEECH_DUMP_CHAT) > 1
-        ):
-            for i in Config.LEECH_DUMP_CHAT[1:]:
-                with contextlib.suppress(Exception):
-                    await _copy(i)
+        LOGGER.info("Mock: Skipping message copy (local storage mode)")
 
     @property
     def speed(self):
